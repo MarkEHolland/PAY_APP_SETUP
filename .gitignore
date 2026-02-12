@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Reference data (large XML and template CSVs)
+Reference Files/
+*.xml
+*.csv
+
+# Misc
+nul
+.streamlit/

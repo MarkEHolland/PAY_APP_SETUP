@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+Reference Files/
+.git/
+.gitignore
+*.md
+skills/
+nul

@@ -28,6 +28,23 @@ A Streamlit web application that enriches SAP SuccessFactors import template fil
 
 8. **Download** — Files can be downloaded individually or as a ZIP, in either CSV (UTF-8 with BOM) or XLSX format.
 
+## Template Identity Requirements
+
+- Every template must contain at least one of: **User ID** or **Person ID External**.
+- The metadata for User ID and Person ID External must be consistent across all templates:
+  - Both are always **Mandatory** (`true`).
+  - Both are always **Type** `string` with **Max Length** `100`.
+- There must always be a **1:1 mapping** between each unique User ID and each unique Person ID External.
+- The master source of the User ID ↔ Person ID External mapping is the **BasicUserInfoImportTemplate**.
+
+## Operation Column
+
+- If a column called **Operation** is found in any template, the user should be prompted to confirm it does not require metadata mapping. This column typically contains an allowed database command (e.g. `insert`, `update`, `delete`) rather than a data property.
+
+## Duration / Period Columns
+
+- Columns that refer to a time or date period duration (e.g. length of service, probation period) are typically auto-calculated from other columns and generally do not need to be **Mandatory** — unless the XML definitively says otherwise via `sap:required="true"`.
+
 ## Type Mapping
 
 | XML Type | Friendly Name |

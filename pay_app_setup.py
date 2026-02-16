@@ -101,6 +101,26 @@ COUNTRY_CODES = [
     "POL", "CZE", "TUN", "EGY", "ISR", "RUS", "SVK", "SVN",
 ]
 
+# Identity columns — every template must have at least one of these.
+# Metadata for these columns is enforced to be consistent across templates.
+_IDENTITY_USERID_NORM = "userid"
+_IDENTITY_PERSONID_NORM = "personidexternal"
+_IDENTITY_NORMS = {_IDENTITY_USERID_NORM, _IDENTITY_PERSONID_NORM}
+_IDENTITY_LABELS = {
+    _IDENTITY_USERID_NORM: "User ID",
+    _IDENTITY_PERSONID_NORM: "Person ID External",
+}
+
+# Operation column — typically a DB command, not a data property.
+_OPERATION_NORM = "operation"
+
+# Duration / period column keywords — these are usually auto-calculated
+# and should not be forced to Mandatory unless XML explicitly requires it.
+_DURATION_KEYWORDS = {
+    "duration", "period", "lengthofservice", "tenure", "probation",
+    "probationperiod", "noticperiod", "noticeperiod", "servicedate",
+}
+
 # Regex to detect pipe-delimited country-specific descriptions,
 # e.g. "GBR: County | JPN: State | USA: State/Province"
 _COUNTRY_DESC_RE = re.compile(
@@ -250,6 +270,11 @@ def _filter_country_description(description: str, country: str) -> str:
 # ---------------------------------------------------------------------------
 # Transformation
 # ---------------------------------------------------------------------------
+def _is_duration_column(norm_key: str) -> bool:
+    """Return True if the normalised column name suggests a duration/period field."""
+    return any(kw in norm_key for kw in _DURATION_KEYWORDS)
+
+
 def transform_template(
     filename: str,
     property_names: list[str],
@@ -257,6 +282,7 @@ def transform_template(
     global_lookup: dict,
     entity_lookup: dict,
     country: str = "",
+    skip_operation: bool = False,
 ) -> tuple[pd.DataFrame, str | None]:
     """
     Build the enriched Import Template DataFrame.
@@ -280,11 +306,34 @@ def transform_template(
     max_lengths = []
 
     for prop_name in property_names:
+        norm_key = _normalise_property_name(prop_name)
+
+        # Enforce consistent metadata for identity columns
+        if norm_key in _IDENTITY_NORMS:
+            column_names.append(_IDENTITY_LABELS[norm_key])
+            types.append("string")
+            mandatories.append("true")
+            max_lengths.append("100")
+            continue
+
+        # Operation column — skip metadata if user confirmed
+        if norm_key == _OPERATION_NORM and skip_operation:
+            column_names.append("Operation")
+            types.append("string")
+            mandatories.append("false")
+            max_lengths.append("")
+            continue
+
         meta = lookup_property(prop_name, entity_props, global_lookup)
         if meta:
             column_names.append(meta["label"] if meta["label"] else prop_name)
-            types.append(friendly_type(meta["type"]))
-            mandatories.append(meta["required"] if meta["required"] else "false")
+            typ = friendly_type(meta["type"])
+            types.append(typ)
+            # Duration columns: only mandatory if XML explicitly says so
+            if _is_duration_column(norm_key):
+                mandatories.append(meta["required"] if meta["required"] == "true" else "false")
+            else:
+                mandatories.append(meta["required"] if meta["required"] else "false")
             max_lengths.append(meta["max_length"])
         else:
             column_names.append(prop_name)
@@ -416,6 +465,18 @@ def main():
         st.warning("No templates selected.")
         return
 
+    # ---- Identity column validation ----
+    missing_identity: list[str] = []
+    for t in templates:
+        norm_cols = {_normalise_property_name(c) for c in t["property_names"]}
+        if not norm_cols & _IDENTITY_NORMS:
+            missing_identity.append(t["name"])
+    if missing_identity:
+        st.warning(
+            "The following templates do not contain a **User ID** or **Person ID External** column: "
+            f"**{', '.join(missing_identity)}**"
+        )
+
     # ---- Preview templates ----
     with st.expander("Preview uploaded templates", expanded=False):
         for t in templates:
@@ -425,6 +486,33 @@ def main():
                 index=["Property Names", "Descriptions"],
             )
             st.dataframe(preview_df, use_container_width=True)
+
+    # ---- Operation column check ----
+    has_operation: list[str] = []
+    for t in templates:
+        norm_cols = {_normalise_property_name(c) for c in t["property_names"]}
+        if _OPERATION_NORM in norm_cols:
+            has_operation.append(t["name"])
+
+    skip_operation = False
+    if has_operation:
+        st.warning(
+            f"An **Operation** column was found in: **{', '.join(has_operation)}**. "
+            "This typically contains a database command (e.g. `insert`, `update`, `delete`) "
+            "and does not require metadata mapping."
+        )
+        skip_operation = st.checkbox(
+            "Confirm: skip metadata mapping for the Operation column",
+            value=True,
+            key="skip_operation",
+        )
+
+    # ---- Identity mapping note ----
+    st.info(
+        "**Identity mapping rule:** There must be a 1:1 mapping between each unique "
+        "User ID and Person ID External. The master source of this mapping is "
+        "**BasicUserInfoImportTemplate**."
+    )
 
     # ---- Step 5: Transform ----
     st.header("5. Run Transformation")
@@ -441,6 +529,7 @@ def main():
                 global_lookup,
                 entity_lookup,
                 country,
+                skip_operation=skip_operation,
             )
             results.append({"name": t["name"], "df": result_df, "entity_type": matched_et})
             progress.progress((i + 1) / len(templates), text=f"Processed {t['name']}")

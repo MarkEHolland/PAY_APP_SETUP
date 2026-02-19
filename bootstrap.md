@@ -6,25 +6,27 @@ A Streamlit web application that enriches SAP SuccessFactors import template fil
 
 ## How It Works
 
-1. **Country** — The sidebar has a country picker locked to **GBR**. This is used to filter country-specific descriptions and boost country-affinity EntityType matching.
+1. **Country** — The sidebar has a country picker locked to **GBR**. This is used to boost country-affinity EntityType matching (e.g. `PaymentInformationDetailV3GBR` is preferred over the generic equivalent).
 2. **XML Upload** — The user uploads the OData XML metadata dictionary (`veritasp01D-Metadata.xml`, ~9.4 MB, 886 EntityTypes, 14,000+ properties) via the sidebar.
-3. **Template Upload** — The user uploads one or more CSV or Excel template files. Each template has two rows: row 1 is the property name headers, row 2 is a freeform description of each field.
-4. **Validation** — Files that do not contain exactly 2 rows are flagged with a warning and excluded from processing.
+3. **Template Upload** — The user uploads one or more CSV or Excel template files. Each template has at least one row: row 1 is the property name headers (Column Names), and an optional row 2 is a label/description for each field.
+4. **Validation** — Files that cannot be read are flagged with a warning and excluded from processing.
 5. **Template Selection** — All uploaded files appear in a multiselect. The user can deselect any they don't want to process.
 6. **Transformation** — For each selected template:
-   - Property names are normalised (lowercase, hyphens/underscores removed, dotted paths take the last segment) to match XML property keys.
+   - Property names are normalised (lowercase, hyphens/underscores/spaces removed, dotted paths take the last segment) to match XML property keys.
    - The best matching EntityType is detected by scoring how many columns match, with penalties for Permission/FieldControl entities and boosts for country-affinity entities (e.g. `PaymentInformationDetailV3GBR`).
    - Each column's metadata is looked up from the matched EntityType first, then falls back to a global search across all EntityTypes.
-   - Country-specific descriptions (pipe-delimited, e.g. `"GBR: County | USA: State/Province"`) are filtered to the selected country segment.
-7. **Output** — Each enriched file contains 5 metadata rows (no header row in exports):
+   - Date and time fields always have Max Length set to `10`.
+   - If the XML defines a column as `string` but its normalised name matches a picklist keyword, the Type is upgraded to `picklist`.
+7. **Output** — Each enriched file contains 6 rows (no file header row). Column A holds the row label:
 
-   | Row | Content | Source |
-   |-----|---------|--------|
-   | Column Name | Human-readable label | `sap:label` from XML |
-   | Description | What the field contains / valid values | Original template row 2 |
+   | Row (Column A) | Content | Source |
+   |----------------|---------|--------|
+   | Column Name | Property identifier (technical name) | Template row 1 |
+   | Column Label | Human-readable label | `sap:label` from XML (falls back to property name) |
    | Type | `string`, `float`, `date`, `integer`, `boolean`, `picklist` | `Type` attribute mapped from `Edm.*` |
    | Mandatory | `true` / `false` | `sap:required` from XML |
-   | Max Length | Character limit | `MaxLength` attribute |
+   | Max Length | Character limit (date/time capped at 10) | `MaxLength` attribute |
+   | Picklist Values | Comma-separated distinct values (empty when no data rows present) | Template rows 3+ |
 
 8. **Download** — Files can be downloaded individually or as a ZIP, in either CSV (UTF-8 with BOM) or XLSX format.
 
@@ -44,6 +46,32 @@ A Streamlit web application that enriches SAP SuccessFactors import template fil
 ## Duration / Period Columns
 
 - Columns that refer to a time or date period duration (e.g. length of service, probation period) are typically auto-calculated from other columns and generally do not need to be **Mandatory** — unless the XML definitively says otherwise via `sap:required="true"`.
+
+## Picklist Values
+
+The OData XML metadata dictionary does **not** contain actual picklist option values. It only defines the schema of `PicklistOption` / `PickListValueV2` entities; the real values live in the SAP SuccessFactors database. Picklist values are therefore derived from any data rows present in the uploaded template (rows 3+).
+
+### What IS a picklist
+
+A column is treated as a picklist when:
+
+- Its XML type is `SFOData.*` (navigation/complex types) — these always map to `picklist`.
+- Its XML type is `Edm.String` **and** its normalised column name contains one of the following keywords (in this case the **Type row is upgraded from `string` to `picklist`**):
+  `gender`, `salutation`, `marital`, `legalentity`, `employmenttype`, `employeeclass`,
+  `employeetype`, `contingent` (isContingentWorker), `timezone`, `country`, `nationality`,
+  `addresstype`, `isprimary`, `currency`, `frequency`, `paygroup`, `holidaycalendar`,
+  `eventreason`, `eventtype`, `contracttype`, `costcenter`, `division`, `department`,
+  `businessunit`, `location`, `jobcode`, `jobtitle`, `jobfamily`, `joblevel`, `timetype`,
+  `workschedule`, `payscale`, `locale`, `status`.
+
+### What is NOT a picklist
+
+- Any column with type `date`, `time`, `float`, `integer`, or `boolean`.
+- String columns whose normalised name contains: `firstname`, `lastname`, `middlename`,
+  `preferredname`, `formalname`, `address1/2/3`, `addressline`, `street`, `city`, `postcode`,
+  `postalcode`, `zipcode`, `emailaddress`, `phone`, `fax`, `nationalid`, `nino`, `passport`,
+  `sequencenumber`, `description`, `comments`, `remark`.
+- By rule: dates, floats, integers, IDs, free-text names, addresses, and postcodes are never picklists.
 
 ## Type Mapping
 

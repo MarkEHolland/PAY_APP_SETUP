@@ -29,29 +29,27 @@ The app opens in your browser at [http://localhost:8501](http://localhost:8501).
 
 ### Step-by-Step Guide
 
-1. **Select Country** (Sidebar) — The country picker is pre-set to **GBR**. This controls how country-specific descriptions are filtered in the output.
+1. **Select Country** (Sidebar) — The country picker is pre-set to **GBR**. This controls EntityType matching — templates are matched to EntityTypes that end with the selected country code (e.g. `EmpJobGBR`) in preference to generic or other-country EntityTypes.
 
 2. **Upload XML Metadata** (Sidebar) — Click "Browse files" and select your OData XML metadata dictionary (e.g. `veritasp01D-Metadata.xml`). Once loaded, the sidebar confirms how many property definitions and entity types were found.
 
-3. **Upload Templates** (Main area, Step 3) — Click "Browse files" and select one or more CSV or Excel template files. Each template should have exactly 2 rows:
-   - **Row 1**: Property name headers (e.g. `email-address`, `start-date`, `USERID`)
-   - **Row 2**: Freeform descriptions of each field
-
-   Files with fewer or more than 2 rows will be flagged with a warning.
+3. **Upload Templates** (Main area, Step 3) — Click "Browse files" and select one or more CSV or Excel template files. Each template should have at least one row:
+   - **Row 1**: Property name headers (Column Names), e.g. `email-address`, `start-date`, `USERID`
+   - **Row 2** *(optional)*: Labels or descriptions for each field
 
 4. **Select Templates to Process** (Step 4) — All uploaded files appear in a multiselect. Deselect any you don't want to include.
 
 5. **Generate** (Step 5) — Click **Generate Import Templates**. The app will:
    - Match each template to the best SAP EntityType from the XML
    - Look up metadata (label, type, mandatory flag, max length) for every column
-   - Filter country-specific descriptions to the selected country
 
-6. **Review Results** (Step 6) — Each processed template is displayed as a table with 5 metadata rows:
-   - **Column Name** — Human-readable label from the XML
-   - **Description** — Original description from the template (country-filtered if applicable)
+6. **Review Results** (Step 6) — Each processed template is displayed as a table with 6 rows:
+   - **Column Name** — Property identifier (technical name from the template)
+   - **Column Label** — Human-readable label from the XML (`sap:label`)
    - **Type** — `string`, `float`, `date`, `integer`, `boolean`, or `picklist`
    - **Mandatory** — `true` or `false`
-   - **Max Length** — Character limit
+   - **Max Length** — Character limit (date/time fields always show `10`)
+   - **Picklist Values** — Comma-separated distinct values from template data rows (empty if the template has no data rows)
 
    A caption beneath each table shows which EntityType was matched.
 
@@ -59,7 +57,7 @@ The app opens in your browser at [http://localhost:8501](http://localhost:8501).
    - Single file: click the individual download button
    - Multiple files: click **Download all enriched templates (.zip)**
 
-   Exported files contain the 5 metadata rows without the property name header row.
+   Exported files contain the 6 rows with row labels in column A and no file header row.
 
 ---
 
@@ -73,7 +71,7 @@ Use the reference files in `Reference Files/Template/` to verify end-to-end beha
 
 1. Run the app: `py -m streamlit run pay_app_setup.py`
 2. **Sidebar** — Leave country as **GBR** (default)
-3. **Sidebar** — Upload `Reference Files/Template/veritasp01D-Metadata.xml`
+3. **Sidebar** — Upload `Reference Files/XML Metadata Dictionary/veritasp01D-Metadata.xml`
    - Confirm the sidebar shows: *"Loaded 14,395 property definitions across 886 entity types."*
 4. **Step 3** — Upload `Reference Files/Template/EmailInfoImportTemplate_veritasp01D.csv`
 5. **Step 4** — Confirm it appears selected in the multiselect
@@ -82,69 +80,67 @@ Use the reference files in `Reference Files/Template/` to verify end-to-end beha
 
    | | email-address | email-type | isPrimary | personInfo.person-id-external | operation |
    |---|---|---|---|---|---|
-   | **Column Name** | Email Address | Email Type | Is Primary | Person ID External | Operation |
-   | **Description** | Email Address | Email Type | Is Primary | Person ID External | Operation |
-   | **Type** | string | string | string | string | string |
-   | **Mandatory** | true | true | false | true | false |
+   | **Column Name** | email-address | email-type | isPrimary | personInfo.person-id-external | operation |
+   | **Column Label** | Email Address | Email Type | Is Primary | Person ID External | Operation |
+   | **Type** | string | string | boolean | string | string |
+   | **Mandatory** | true | true | true | true | false |
    | **Max Length** | 100 | 38 | | 100 | |
+   | **Picklist Values** | | | | | |
+
+   *(Picklist Values are empty because the reference template has no data rows.)*
 
    - Confirm the caption reads *"Best matching EntityType: PerEmail"*
-8. **Step 7** — Select CSV, click download, open the file and verify it has 5 rows (5 metadata rows, no header)
+8. **Step 7** — Select CSV, click download, open the file and verify it has 6 rows (row labels in column A, no file header)
 
-## Test 2 — Country Description Filtering (GBR)
+## Test 2 — Column Label from XML
 
-**Goal**: Confirm the GBR country setting filters pipe-delimited descriptions.
+**Goal**: Confirm the XML sap:label is correctly mapped to the Column Label row.
 
-1. **Sidebar** — Confirm country is **GBR**
-2. Upload `Reference Files/Template/AddressImportTemplate_veritasp01D.csv`
-3. Click **Generate Import Templates**
-4. In the results, check the `state` column:
-   - The original template description is `"GBR: County | JPN: State | PER: State/Province | USA: State/Province"`
-   - With GBR selected, the **Description** row should show just: **County**
-5. Repeat with `EmergencyContactImportTemplate_veritasp01D.csv` — the `homeAddress.state` description should filter the same way
+1. Upload `Reference Files/Template/AddressImportTemplate_veritasp01D.csv`
+2. Click **Generate Import Templates**
+3. In the results, verify the `state` column:
+   - **Column Name** row: `state`
+   - **Column Label** row: the sap:label value from XML (e.g. `State/Province` or country-specific label)
 
 ## Test 3 — Multiple Files, Batch Processing
 
 **Goal**: Confirm batch processing and ZIP download.
 
-1. With the XML already loaded, upload all 14 CSV files from `Reference Files/Template/` (excluding the XML)
-2. **Step 4** — All 14 files should appear selected
+1. With the XML already loaded, upload all 13 CSV files from `Reference Files/Template/`
+2. **Step 4** — All 13 files should appear selected
 3. Click **Generate Import Templates**
 4. Verify each result table shows a matched EntityType in the caption
 5. Select XLSX format, click **Download all enriched templates (.zip)**
-6. Extract the ZIP and confirm it contains 14 `_enriched.xlsx` files
+6. Extract the ZIP and confirm it contains 13 `_enriched.xlsx` files
 7. Open `JobInfoImportTemplate_veritasp01D_enriched.xlsx` and spot-check:
-   - `job-code` column should show: Column Name = "Job Code", Type = "string", Mandatory = "true", Max Length = "8"
-   - `start-date` column should show: Column Name = "Event Date", Type = "date", Mandatory = "true"
+   - `job-code` column: Column Name = "job-code", Column Label = "Job Code", Type = "picklist", Mandatory = "true", Max Length = "8", Picklist Values = "" *(no data rows in reference template)*
+   - `start-date` column: Column Name = "start-date", Column Label = "Event Date", Type = "date", Mandatory = "true", Max Length = "10", Picklist Values = "" *(date type — never a picklist)*
 
 ## Test 4 — Interactive File Removal
 
 **Goal**: Confirm deselecting files excludes them from processing.
 
-1. Upload 3 template files (e.g. `Bank.csv`, `PersonInfoImportTemplate_veritasp01D.csv`, `CompInfoImportTemplate_veritasp01D.csv`)
-2. In **Step 4**, deselect `Bank.csv` from the multiselect
+1. Upload 3 template files (e.g. `PhoneInfoImportTemplate_veritasp01D.csv`, `PersonInfoImportTemplate_veritasp01D.csv`, `CompInfoImportTemplate_veritasp01D.csv`)
+2. In **Step 4**, deselect `PhoneInfoImportTemplate_veritasp01D.csv` from the multiselect
 3. Click **Generate Import Templates**
-4. Verify only 2 result tables appear (no Bank output)
+4. Verify only 2 result tables appear (PhoneInfo is excluded)
 
 ## Test 5 — Invalid File Handling
 
-**Goal**: Confirm files with fewer than 2 rows are flagged.
+**Goal**: Confirm unreadable files are flagged and skipped.
 
-1. Create a test file `single_row.csv` with only one row of headers:
-   ```
-   col-a,col-b,col-c
-   ```
+1. Create a test file `empty.csv` with no content (0 bytes)
 2. Upload it alongside a valid template
-3. Confirm a warning appears: *"The following files do not contain exactly 2 rows and were flagged: single_row.csv"*
+3. Confirm a warning appears: *"The following files could not be read and were skipped: empty.csv"*
 4. Confirm the valid template still processes normally
 
 ## Test 6 — Unmatched Column Warning
 
 **Goal**: Confirm columns with no XML match are reported.
 
-1. Upload `Bank.csv`
+1. Upload `Reference Files/Template/Payment Information .csv`
 2. Process it and check the results
-3. Verify a warning appears noting that `[OPERATOR]` had no XML match (this is expected — it's a special instruction column, not a property)
+3. Verify a warning appears noting that `[OPERATOR]` had no XML match (this is expected — it's a special instruction column, not a data property)
 
 ## Test 7 — Excel Template Input
 
@@ -161,8 +157,9 @@ Use the reference files in `Reference Files/Template/` to verify end-to-end beha
 1. Process any template
 2. Download as **CSV** — open in a text editor and confirm:
    - UTF-8 BOM is present (for Excel compatibility)
-   - 5 rows (5 metadata rows, no header)
+   - 6 rows, column A contains: `Column Name`, `Column Label`, `Type`, `Mandatory`, `Max Length`, `Picklist Values`
+   - No file header row
 3. Download as **XLSX** — open in Excel and confirm:
    - Sheet name is "Import Template"
-   - Same 5-row structure
+   - Same 6-row structure with row labels in column A
    - No formatting artefacts

@@ -8,7 +8,6 @@ enriched Import Template files with additional metadata rows.
 
 import io
 import os
-import re
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -44,11 +43,12 @@ TYPE_MAP = {
 def _normalise_property_name(col: str) -> str:
     """
     Normalise a CSV column header to a canonical key for lookup.
-    Handles UPPERCASE, kebab-case, dotted navigation paths, and underscores.
+    Handles UPPERCASE, kebab-case, space-separated, dotted navigation paths,
+    and underscores.
     """
     if "." in col:
         col = col.rsplit(".", 1)[-1]
-    return col.replace("-", "").replace("_", "").lower()
+    return col.replace("-", "").replace("_", "").replace(" ", "").lower()
 
 
 def parse_xml_metadata(xml_file) -> tuple[dict, dict]:
@@ -121,11 +121,41 @@ _DURATION_KEYWORDS = {
     "probationperiod", "noticperiod", "noticeperiod", "servicedate",
 }
 
-# Regex to detect pipe-delimited country-specific descriptions,
-# e.g. "GBR: County | JPN: State | USA: State/Province"
-_COUNTRY_DESC_RE = re.compile(
-    r"^[A-Z]{3}\s*:\s*.+\|", re.DOTALL
-)
+# ---------------------------------------------------------------------------
+# Picklist rules
+# The XML metadata dictionary does NOT contain actual picklist option values —
+# it only defines the schema of PicklistOption / PickListValueV2 entities.
+# Picklist values must therefore be derived from data rows in the uploaded
+# template (rows 3+) using the rules below.
+# ---------------------------------------------------------------------------
+_MAX_PICKLIST_VALUES = 20
+
+# Normalised column-name substrings that indicate a string column is likely
+# a picklist.  SFOData.* (XML-typed) columns are always picklists regardless
+# of these keywords.
+_PICKLIST_SUBSTRINGS = frozenset({
+    "gender", "salutation", "marital", "legalentity",
+    "employmenttype", "employeeclass", "employeetype", "contingent",
+    "timezone", "country", "nationality", "addresstype", "isprimary",
+    "currency", "frequency", "paygroup", "holidaycalendar",
+    "eventreason", "eventtype", "contracttype",
+    "costcenter", "division", "department", "businessunit",
+    "location", "jobcode", "jobtitle", "jobfamily", "joblevel",
+    "timetype", "workschedule", "payscale",
+    "locale", "status",
+})
+
+# Normalised column-name substrings that override the above and mark a column
+# as NOT a picklist (names, free-text fields, IDs, addresses, etc.).
+_NON_PICKLIST_SUBSTRINGS = frozenset({
+    "firstname", "lastname", "middlename", "preferredname",
+    "formalname", "suffixname",
+    "address1", "address2", "address3", "addressline", "street",
+    "city", "postcode", "postalcode", "zipcode",
+    "emailaddress", "phone", "fax",
+    "nationalid", "nino", "passport",
+    "sequencenumber", "description", "comments", "remark",
+})
 
 
 def find_best_entity_type(
@@ -211,11 +241,12 @@ def friendly_type(edm_type: str) -> str:
 # ---------------------------------------------------------------------------
 # Template file reading
 # ---------------------------------------------------------------------------
-def read_template(uploaded_file) -> tuple[str, list[str], list[str], bool]:
+def read_template(uploaded_file) -> tuple[str, list[str], list[str], list[list[str]], bool]:
     """
     Read a template file (CSV or Excel).
-    Returns (filename, row1_values, row2_values, is_valid).
-    A valid template has exactly 2 rows (header + description).
+    Returns (filename, property_names, descriptions, data_rows, is_valid).
+    A valid template has at least 1 row.  Rows 3+ are treated as data rows
+    and used for picklist value extraction.
     """
     name = uploaded_file.name
     ext = os.path.splitext(name)[1].lower()
@@ -234,37 +265,15 @@ def read_template(uploaded_file) -> tuple[str, list[str], list[str], bool]:
             df = pd.read_csv(io.StringIO(text), header=None, dtype=str)
     except Exception as e:
         st.error(f"Could not read **{name}**: {e}")
-        return name, [], [], False
+        return name, [], [], [], False
 
-    if len(df) < 2:
-        return name, list(df.iloc[0].fillna("")) if len(df) >= 1 else [], [], False
+    if len(df) < 1:
+        return name, [], [], [], False
 
     row1 = list(df.iloc[0].fillna(""))  # Property Names
-    row2 = list(df.iloc[1].fillna(""))  # Descriptions
-    return name, row1, row2, True
-
-
-# ---------------------------------------------------------------------------
-# Description helpers
-# ---------------------------------------------------------------------------
-def _filter_country_description(description: str, country: str) -> str:
-    """
-    If *description* is a pipe-delimited set of country-specific values
-    like ``"GBR: County | JPN: State | USA: State/Province"``, return only
-    the segment for *country*.  Otherwise return the original string.
-    """
-    if not country or "|" not in description:
-        return description
-    # Quick check: does it look like "XXX: value | YYY: value" ?
-    if not _COUNTRY_DESC_RE.match(description.strip()):
-        return description
-
-    segments = [s.strip() for s in description.split("|")]
-    for seg in segments:
-        if seg.upper().startswith(country + ":"):
-            return seg[len(country) + 1:].strip()
-    # Country not listed — return full string so nothing is lost
-    return description
+    row2 = list(df.iloc[1].fillna("")) if len(df) >= 2 else []
+    data_rows = [list(df.iloc[i].fillna("")) for i in range(2, len(df))] if len(df) > 2 else []
+    return name, row1, row2, data_rows, True
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +284,49 @@ def _is_duration_column(norm_key: str) -> bool:
     return any(kw in norm_key for kw in _DURATION_KEYWORDS)
 
 
+def _is_picklist_column(norm_key: str, friendly_type_val: str) -> bool:
+    """
+    Return True if this column should have a Picklist Values entry.
+
+    Rules:
+    - XML type 'picklist' (SFOData.*) → always a picklist.
+    - date, time, float, integer, boolean → never a picklist.
+    - string → picklist if norm_key contains a _PICKLIST_SUBSTRINGS keyword
+      and does NOT contain a _NON_PICKLIST_SUBSTRINGS override keyword.
+    """
+    if friendly_type_val == "picklist":
+        return True
+    if friendly_type_val in ("date", "time", "float", "integer", "boolean"):
+        return False
+    if friendly_type_val == "string":
+        if any(kw in norm_key for kw in _NON_PICKLIST_SUBSTRINGS):
+            return False
+        return any(kw in norm_key for kw in _PICKLIST_SUBSTRINGS)
+    return False
+
+
+def _extract_picklist_values(
+    column_index: int,
+    data_rows: list[list[str]],
+    max_values: int = _MAX_PICKLIST_VALUES,
+) -> str:
+    """
+    Return a comma-separated string of unique non-empty values found at
+    *column_index* across all *data_rows*, capped at *max_values* items.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for row in data_rows:
+        if column_index < len(row):
+            val = str(row[column_index]).strip()
+            if val and val not in seen_set:
+                seen_set.add(val)
+                seen.append(val)
+                if len(seen) >= max_values:
+                    break
+    return ", ".join(seen)
+
+
 def transform_template(
     filename: str,
     property_names: list[str],
@@ -283,16 +335,20 @@ def transform_template(
     entity_lookup: dict,
     country: str = "",
     skip_operation: bool = False,
+    data_rows: list[list[str]] | None = None,
 ) -> tuple[pd.DataFrame, str | None]:
     """
     Build the enriched Import Template DataFrame.
 
-    Output rows (under original column headers):
-      Row 1: Column Name  (sap:label from XML, falls back to property name)
-      Row 2: Description  (original row 2 from template)
-      Row 3: Type         (friendly type name)
-      Row 4: Mandatory    (true/false from sap:required)
-      Row 5: Max Length
+    Output rows (exported with row label in column A, no header row):
+      Row 1 — Column Name     : property identifier from the template
+      Row 2 — Column Label    : sap:label from XML (falls back to property name)
+      Row 3 — Type            : friendly type name
+      Row 4 — Mandatory       : true / false
+      Row 5 — Max Length      : capped at 10 for date/time fields
+      Row 6 — Picklist Values : comma-separated values from template data rows
+                                (only populated for picklist/keyword-matched string columns;
+                                 empty when no data rows are present in the template)
 
     Returns (DataFrame, matched_entity_type_name).
     """
@@ -300,63 +356,81 @@ def transform_template(
     best_et = find_best_entity_type(property_names, entity_lookup, country)
     entity_props = entity_lookup.get(best_et) if best_et else None
 
-    column_names = []
-    types = []
-    mandatories = []
-    max_lengths = []
+    column_labels: list[str] = []   # sap:label (Column Label row)
+    types: list[str] = []
+    mandatories: list[str] = []
+    max_lengths: list[str] = []
+    picklist_values: list[str] = []
 
-    for prop_name in property_names:
+    for i, prop_name in enumerate(property_names):
         norm_key = _normalise_property_name(prop_name)
 
         # Enforce consistent metadata for identity columns
         if norm_key in _IDENTITY_NORMS:
-            column_names.append(_IDENTITY_LABELS[norm_key])
+            column_labels.append(_IDENTITY_LABELS[norm_key])
             types.append("string")
             mandatories.append("true")
             max_lengths.append("100")
+            picklist_values.append("")
             continue
 
         # Operation column — skip metadata if user confirmed
         if norm_key == _OPERATION_NORM and skip_operation:
-            column_names.append("Operation")
+            column_labels.append("Operation")
             types.append("string")
             mandatories.append("false")
             max_lengths.append("")
+            picklist_values.append("")
             continue
 
         meta = lookup_property(prop_name, entity_props, global_lookup)
         if meta:
-            column_names.append(meta["label"] if meta["label"] else prop_name)
+            column_labels.append(meta["label"] if meta["label"] else prop_name)
             typ = friendly_type(meta["type"])
+            # Picklist keyword upgrade: if the XML says string but the column name
+            # matches picklist keywords, upgrade the type so Type and Picklist Values
+            # rows are always consistent.
+            if typ == "string" and _is_picklist_column(norm_key, "string"):
+                typ = "picklist"
             types.append(typ)
             # Duration columns: only mandatory if XML explicitly says so
             if _is_duration_column(norm_key):
                 mandatories.append(meta["required"] if meta["required"] == "true" else "false")
             else:
                 mandatories.append(meta["required"] if meta["required"] else "false")
-            max_lengths.append(meta["max_length"])
+            # Date fields: enforce max length of 10
+            if typ in ("date", "time"):
+                max_lengths.append("10")
+            else:
+                max_lengths.append(meta["max_length"])
         else:
-            column_names.append(prop_name)
-            types.append("")
+            column_labels.append(prop_name)
+            typ = ""
+            types.append(typ)
             mandatories.append("")
             max_lengths.append("")
 
-    # Pad / trim descriptions to match column count
-    desc = descriptions + [""] * (len(property_names) - len(descriptions))
-    desc = desc[: len(property_names)]
+        # Picklist Values row — populated from template data rows.
+        # Extracted only for SFOData.* (picklist) and keyword-matched string columns.
+        if _is_picklist_column(norm_key, typ) and data_rows:
+            picklist_values.append(_extract_picklist_values(i, data_rows))
+        else:
+            picklist_values.append("")
 
-    # Filter country-specific descriptions
-    if country:
-        desc = [_filter_country_description(d, country) for d in desc]
-
-    data = {
-        prop_name: [col_name, desc[i], typ, mand, maxl]
-        for i, (prop_name, col_name, typ, mand, maxl) in enumerate(
-            zip(property_names, column_names, types, mandatories, max_lengths)
-        )
-    }
-
-    df = pd.DataFrame(data, index=["Column Name", "Description", "Type", "Mandatory", "Max Length"])
+    # Build DataFrame:
+    #   columns = property_names (always unique — safe for st.dataframe display)
+    #   index   = row descriptors (written as column A in the exported file)
+    rows = [
+        property_names,  # Column Name
+        column_labels,   # Column Label
+        types,           # Type
+        mandatories,     # Mandatory
+        max_lengths,     # Max Length
+        picklist_values, # Picklist Values
+    ]
+    row_index = ["Column Name", "Column Label", "Type", "Mandatory", "Max Length", "Picklist Values"]
+    df = pd.DataFrame(rows, index=row_index, columns=property_names)
+    df.index.name = "Label"
     return df, best_et
 
 
@@ -364,17 +438,27 @@ def transform_template(
 # Export helpers
 # ---------------------------------------------------------------------------
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """Export a DataFrame to CSV bytes (UTF-8 with BOM for Excel compat)."""
+    """Export a DataFrame to CSV bytes (UTF-8 with BOM for Excel compat).
+
+    Output: 6 rows, no header row.
+    Column A = row label (Column Name / Column Label / Type / …).
+    Remaining columns = values for each property.
+    """
     buf = io.StringIO()
-    df.to_csv(buf, index=False, header=False)
+    df.to_csv(buf, index=True, header=False)
     return ("\ufeff" + buf.getvalue()).encode("utf-8-sig")
 
 
 def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    """Export a DataFrame to XLSX bytes."""
+    """Export a DataFrame to XLSX bytes.
+
+    Output: 6 rows, no header row.
+    Column A = row label (Column Name / Column Label / Type / …).
+    Remaining columns = values for each property.
+    """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, header=False, sheet_name="Import Template")
+        df.to_excel(writer, index=True, header=False, sheet_name="Import Template")
     return buf.getvalue()
 
 
@@ -396,7 +480,7 @@ def main():
         options=["GBR"],
         index=0,
         key="country_select",
-        help="Used to prefer country-specific EntityTypes and filter descriptions.",
+        help="Used to prefer country-specific EntityTypes (e.g. EmpJobGBR) during matching.",
     )
 
     st.sidebar.header("2. XML Metadata Dictionary")
@@ -433,15 +517,20 @@ def main():
     flagged: list[str] = []
 
     for uf in uploaded_files:
-        name, row1, row2, valid = read_template(uf)
+        name, row1, row2, data_rows, valid = read_template(uf)
         if valid:
-            templates.append({"name": name, "property_names": row1, "descriptions": row2})
+            templates.append({
+                "name": name,
+                "property_names": row1,
+                "descriptions": row2,
+                "data_rows": data_rows,
+            })
         else:
             flagged.append(name)
 
     if flagged:
         st.warning(
-            f"The following files do not contain exactly 2 rows and were flagged: "
+            f"The following files could not be read and were skipped: "
             f"**{', '.join(flagged)}**"
         )
 
@@ -481,10 +570,8 @@ def main():
     with st.expander("Preview uploaded templates", expanded=False):
         for t in templates:
             st.subheader(t["name"])
-            preview_df = pd.DataFrame(
-                [t["property_names"], t["descriptions"]],
-                index=["Property Names", "Descriptions"],
-            )
+            preview_rows = [t["property_names"], t["descriptions"]]
+            preview_df = pd.DataFrame(preview_rows, index=["Column Name", "Column Label"])
             st.dataframe(preview_df, use_container_width=True)
 
     # ---- Operation column check ----
@@ -530,6 +617,7 @@ def main():
                 entity_lookup,
                 country,
                 skip_operation=skip_operation,
+                data_rows=t.get("data_rows", []),
             )
             results.append({"name": t["name"], "df": result_df, "entity_type": matched_et})
             progress.progress((i + 1) / len(templates), text=f"Processed {t['name']}")
@@ -543,10 +631,18 @@ def main():
 
         st.header("6. Results")
 
-        # Show unmatched properties summary
+        # Show unmatched properties summary.
+        # A column is unmatched when its Column Label (sap:label) == its property name
+        # (meaning the label fell back to the property name — no XML entry found)
+        # AND its Type row is empty.
         for r in results:
             df = r["df"]
-            unmatched = [col for col in df.columns if df[col].iloc[0] == col and df[col].iloc[2] == ""]
+            col_label_row = df.loc["Column Label"] if "Column Label" in df.index else pd.Series(dtype=str)
+            type_row = df.loc["Type"] if "Type" in df.index else pd.Series(dtype=str)
+            unmatched = [
+                col for col in df.columns
+                if str(col_label_row.get(col, "")) == col and str(type_row.get(col, "")) == ""
+            ]
             if unmatched:
                 st.warning(
                     f"**{r['name']}**: {len(unmatched)} column(s) had no XML match: "

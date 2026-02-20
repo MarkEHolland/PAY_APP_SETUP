@@ -445,7 +445,7 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     Remaining columns = values for each property.
     """
     buf = io.StringIO()
-    df.to_csv(buf, index=True, header=False)
+    df.to_csv(buf, index=False, header=False)
     return ("\ufeff" + buf.getvalue()).encode("utf-8-sig")
 
 
@@ -458,7 +458,7 @@ def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=True, header=False, sheet_name="Import Template")
+        df.to_excel(writer, index=False, header=False, sheet_name="Import Template")
     return buf.getvalue()
 
 

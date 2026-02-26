@@ -111,8 +111,8 @@ def parse_picklist_reference(
       Row 2+ — data / picklist values.
 
     Returns:
-        picklist_tables  — {display_name: [(code, label), ...]}
-        col_to_picklist  — {normalised_col_name: display_name}  (auto-mapped)
+        picklist_tables   — {display_name: [(code, label), ...]}
+        col_to_picklist   — {normalised_col_name: display_name}  (auto-mapped)
     """
     picklist_tables: dict[str, list[tuple[str, str]]] = {}
     col_to_picklist: dict[str, str] = {}
@@ -543,7 +543,6 @@ def _gather_template_data_values(
 def transform_template(
     filename: str,
     property_names: list[str],
-    descriptions: list[str],
     global_lookup: dict,
     entity_lookup: dict,
     country: str = "",
@@ -554,7 +553,7 @@ def transform_template(
     """
     Build the enriched Import Template DataFrame.
 
-    Output rows (exported with row label in column A, no header row):
+    Output rows:
       Row 1 — Column Name     : property identifier from the template
       Row 2 — Column Label    : sap:label from XML (falls back to property name)
       Row 3 — Type            : friendly type name
@@ -571,7 +570,7 @@ def transform_template(
     best_et = find_best_entity_type(property_names, entity_lookup, country)
     entity_props = entity_lookup.get(best_et) if best_et else None
 
-    column_labels: list[str] = []   # sap:label (Column Label row)
+    column_labels: list[str] = []        # sap:label (Column Label row)
     types: list[str] = []
     mandatories: list[str] = []
     max_lengths: list[str] = []
@@ -639,14 +638,14 @@ def transform_template(
 
     # Build DataFrame:
     #   columns = property_names (always unique — safe for st.dataframe display)
-    #   index   = row descriptors (written as column A in the exported file)
+    #   index   = row descriptors
     rows = [
-        property_names,  # Column Name
-        column_labels,   # Column Label
-        types,           # Type
-        mandatories,     # Mandatory
-        max_lengths,     # Max Length
-        picklist_values, # Picklist Values
+        property_names,       # Column Name
+        column_labels,        # Column Label
+        types,                # Type
+        mandatories,          # Mandatory
+        max_lengths,          # Max Length
+        picklist_values,      # Picklist Values
     ]
     row_index = ["Column Name", "Column Label", "Type", "Mandatory", "Max Length", "Picklist Values"]
     df = pd.DataFrame(rows, index=row_index, columns=property_names)
@@ -660,9 +659,8 @@ def transform_template(
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Export a DataFrame to CSV bytes (UTF-8 with BOM for Excel compat).
 
-    Output: 6 rows, no header row.
-    Column A = row label (Column Name / Column Label / Type / …).
-    Remaining columns = values for each property.
+    Output: 6 rows (Column Name / Column Label / Type /
+    Mandatory / Max Length / Picklist Values), no row-label column, no header.
     """
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False)
@@ -672,9 +670,8 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     """Export a DataFrame to XLSX bytes.
 
-    Output: 6 rows, no header row.
-    Column A = row label (Column Name / Column Label / Type / …).
-    Remaining columns = values for each property.
+    Output: 6 rows (Column Name / Column Label / Type /
+    Mandatory / Max Length / Picklist Values), no row-label column, no header.
     """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -733,7 +730,7 @@ def main():
         return
 
     # ---- Sidebar: Picklist Reference Files (optional, multiple) ----
-    st.sidebar.header("3. Picklist Reference Files")
+    st.sidebar.header("3. Picklist Reference Files (optional)")
     picklist_ref_files = st.sidebar.file_uploader(
         "Upload picklist reference workbook(s) or CSV(s) (optional)",
         type=["xlsx", "xls", "csv"],
@@ -777,7 +774,7 @@ def main():
                 st.warning("No picklist tables found in the uploaded file(s).")
 
     # ---- Sidebar: Configuration ----
-    st.sidebar.header("4. Configuration")
+    st.sidebar.header("4. Configuration (optional)")
     config_upload = st.sidebar.file_uploader(
         "Load saved configuration (.json)",
         type=["json"],
@@ -1079,7 +1076,6 @@ def main():
             result_df, matched_et = transform_template(
                 t["name"],
                 t["property_names"],
-                t["descriptions"],
                 global_lookup,
                 entity_lookup,
                 country,

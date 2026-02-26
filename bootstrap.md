@@ -34,7 +34,7 @@ A `st.file_uploader` (in the main area) with `accept_multiple_files=True`, accep
 **Step 4: Select Templates to Process**
 A `st.multiselect` with all valid template names pre-selected as default. Filter the templates list to only selected names.
 - Warn if any selected template contains no User ID (`userid`) or Person ID External (`personidexternal`) column.
-- Show a "Preview uploaded templates" `st.expander` (collapsed by default) containing a DataFrame per template (property_names row + descriptions row).
+- Show a "Preview uploaded templates" `st.expander` (collapsed by default) containing a DataFrame per template (property_names row + label_row).
 - Scan for an `operation` column in any template. If found, show a `st.warning` and a `st.checkbox` (key `"skip_operation"`, default `True`) asking the user to confirm skipping metadata mapping for that column.
 - Show an `st.info` box: *"Identity mapping rule: There must be a 1:1 mapping between each unique User ID and Person ID External. The master source of this mapping is BasicUserInfoImportTemplate."*
 
@@ -145,10 +145,10 @@ Returns:
 - For each picklist table, data is extracted from rows 2+ at `code_col` and `code_col + 1`. Empty or `"nan"` codes are skipped.
 - `picklist_tables.setdefault(display_name, values)` — first occurrence per display name across all sheets wins.
 
-### `read_template(uploaded_file) -> (name, property_names, descriptions, data_rows, is_valid)`
+### `read_template(uploaded_file) -> (name, property_names, label_row, data_rows, is_valid)`
 - `.xlsx` / `.xls`: `pd.read_excel(header=None, dtype=str)`.
 - All others: read bytes, decode UTF-8-sig then latin-1 fallback, `pd.read_csv(header=None, dtype=str)`.
-- Row 0 → `property_names`, Row 1 → `descriptions`, Rows 2+ → `data_rows`.
+- Row 0 → `property_names`, Row 1 → `label_row`, Rows 2+ → `data_rows`.
 - `is_valid = len(df) >= 1`.
 
 ### `find_best_entity_type(property_names, entity_lookup, country) -> str | None`

@@ -7,9 +7,11 @@ enriched Import Template files with additional metadata rows.
 """
 
 import io
+import json
 import os
 import zipfile
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -87,6 +89,145 @@ def parse_xml_metadata(xml_file) -> tuple[dict, dict]:
         entity_lookup[et_name] = et_props
 
     return global_lookup, entity_lookup
+
+
+# ---------------------------------------------------------------------------
+# Picklist Reference File Parsing
+# ---------------------------------------------------------------------------
+def parse_picklist_reference(
+    xl_file,
+) -> tuple[dict[str, list[tuple[str, str]]], dict[str, str]]:
+    """
+    Parse a picklist reference file (Excel workbook or CSV).
+
+    Excel workbooks: parses all `(Data)` sheets.
+    CSV files: treated as a two-column (Code, Label) table; the filename
+               (without extension) is used as the picklist name.
+
+    Sheet layout for Excel (0-indexed rows):
+      Row 0 — technical column names (LEFT side); picklist table display names
+              at the 'Code' column positions (RIGHT side).
+      Row 1 — human-readable labels (LEFT); literal 'Code'/'Label' (RIGHT).
+      Row 2+ — data / picklist values.
+
+    Returns:
+        picklist_tables  — {display_name: [(code, label), ...]}
+        col_to_picklist  — {normalised_col_name: display_name}  (auto-mapped)
+    """
+    picklist_tables: dict[str, list[tuple[str, str]]] = {}
+    col_to_picklist: dict[str, str] = {}
+
+    fname = getattr(xl_file, "name", "") or ""
+    ext = os.path.splitext(fname)[1].lower()
+
+    # --- CSV path ---
+    if ext == ".csv":
+        picklist_name = os.path.splitext(os.path.basename(fname))[0].strip() or "Picklist"
+        try:
+            content = xl_file.getvalue()
+            try:
+                text = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = content.decode("latin-1")
+            df = pd.read_csv(io.StringIO(text), header=None, dtype=str)
+        except Exception as e:
+            st.error(f"Could not read CSV picklist reference '{fname}': {e}")
+            return picklist_tables, col_to_picklist
+
+        if len(df) < 1:
+            return picklist_tables, col_to_picklist
+
+        # Skip a header row if the first cell looks like a column label
+        first_cell = str(df.iloc[0, 0]).strip().lower()
+        start_row = 1 if first_cell in ("code", "id", "value", "key", "externalcode") else 0
+
+        values: list[tuple[str, str]] = []
+        for r_idx in range(start_row, len(df)):
+            code_val = str(df.iloc[r_idx, 0]).strip() if df.shape[1] >= 1 else ""
+            label_val = str(df.iloc[r_idx, 1]).strip() if df.shape[1] >= 2 else ""
+            if code_val and code_val.lower() != "nan":
+                label_clean = label_val if label_val and label_val.lower() != "nan" else ""
+                values.append((code_val, label_clean))
+
+        if values:
+            picklist_tables[picklist_name] = values
+
+        return picklist_tables, col_to_picklist
+
+    # --- Excel path ---
+    try:
+        xl = pd.ExcelFile(xl_file)
+    except Exception as e:
+        st.error(f"Could not open picklist reference file: {e}")
+        return picklist_tables, col_to_picklist
+
+    data_sheets = [s for s in xl.sheet_names if s.endswith("(Data)")]
+
+    for sheet_name in data_sheets:
+        try:
+            df = xl.parse(sheet_name, header=None, dtype=str)
+        except Exception:
+            continue
+
+        if len(df) < 2:
+            continue
+
+        row0 = list(df.iloc[0].fillna(""))
+        row1 = list(df.iloc[1].fillna(""))
+
+        # --- RIGHT side: locate picklist table start columns (row1 == "Code") ---
+        table_positions: list[tuple[int, str]] = []
+        for c_idx, r1_val in enumerate(row1):
+            if str(r1_val).strip().lower() == "code":
+                display_name = str(row0[c_idx]).strip() if c_idx < len(row0) else ""
+                if display_name and display_name.lower() != "nan":
+                    table_positions.append((c_idx, display_name))
+
+        if not table_positions:
+            continue
+
+        # --- LEFT side: data column labels (row1), before the first Code col ---
+        first_code_col = table_positions[0][0]
+        left_labels: dict[int, str] = {}  # col_index -> human label
+        for c_idx in range(first_code_col):
+            r0s = str(row0[c_idx]).strip() if c_idx < len(row0) else ""
+            r1s = str(row1[c_idx]).strip() if c_idx < len(row1) else ""
+            if r0s and r0s.lower() != "nan" and r1s and r1s.lower() != "nan":
+                left_labels[c_idx] = r1s
+
+        # --- Extract picklist tables (first occurrence across sheets wins) ---
+        sheet_tables: dict[str, list[tuple[str, str]]] = {}
+        for code_col, display_name in table_positions:
+            label_col = code_col + 1
+            values: list[tuple[str, str]] = []
+            for r_idx in range(2, len(df)):
+                code_val = str(df.iloc[r_idx, code_col]).strip() if code_col < df.shape[1] else ""
+                label_val = (
+                    str(df.iloc[r_idx, label_col]).strip()
+                    if label_col < df.shape[1]
+                    else ""
+                )
+                if code_val and code_val.lower() != "nan":
+                    label_clean = label_val if label_val and label_val.lower() != "nan" else ""
+                    values.append((code_val, label_clean))
+            if values:
+                sheet_tables[display_name] = values
+                picklist_tables.setdefault(display_name, values)
+
+        # --- Auto-map LEFT labels to RIGHT picklist display names ---
+        table_name_lower: dict[str, str] = {
+            name.lower(): name for name in sheet_tables
+        }
+        for c_idx, human_label in left_labels.items():
+            tech_name = str(row0[c_idx]).strip() if c_idx < len(row0) else ""
+            if not tech_name or tech_name.lower() == "nan":
+                continue
+            norm_tech = _normalise_property_name(tech_name)
+            matched_table = table_name_lower.get(human_label.lower())
+            if matched_table and norm_tech:
+                col_to_picklist.setdefault(norm_tech, matched_table)
+
+    return picklist_tables, col_to_picklist
 
 
 # EntityType name patterns that represent permission/metadata mirrors,
@@ -327,6 +468,78 @@ def _extract_picklist_values(
     return ", ".join(seen)
 
 
+def _get_picklist_candidates(
+    templates: list[dict],
+    global_lookup: dict,
+    entity_lookup: dict,
+) -> list[tuple[str, str, str]]:
+    """
+    Return deduplicated (template_name, col_name, norm_col) for every column
+    that is a picklist candidate across the supplied templates.
+
+    Excludes identity columns and the operation column.
+    Each unique norm_col appears at most once (attributed to the first template).
+    """
+    seen_norms: set[str] = set()
+    candidates: list[tuple[str, str, str]] = []
+
+    for t in templates:
+        best_et = find_best_entity_type(t["property_names"], entity_lookup)
+        entity_props = entity_lookup.get(best_et) if best_et else None
+
+        for col_name in t["property_names"]:
+            norm_col = _normalise_property_name(col_name)
+
+            if norm_col in seen_norms or norm_col in _IDENTITY_NORMS or norm_col == _OPERATION_NORM:
+                continue
+
+            meta = lookup_property(col_name, entity_props, global_lookup)
+            typ = friendly_type(meta["type"]) if meta else ""
+
+            if typ == "string" and _is_picklist_column(norm_col, "string"):
+                typ = "picklist"
+
+            if _is_picklist_column(norm_col, typ):
+                seen_norms.add(norm_col)
+                candidates.append((t["name"], col_name, norm_col))
+
+    return candidates
+
+
+def _gather_template_data_values(
+    norm_col: str,
+    templates: list[dict],
+    max_values: int = 8,
+) -> str:
+    """
+    Collect unique non-empty values for *norm_col* from the data rows (rows 3+)
+    across all supplied templates.  Returns a comma-separated string.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for t in templates:
+        col_idx = next(
+            (i for i, c in enumerate(t["property_names"]) if _normalise_property_name(c) == norm_col),
+            None,
+        )
+        if col_idx is None:
+            continue
+        for row in t.get("data_rows", []):
+            if col_idx < len(row):
+                val = str(row[col_idx]).strip()
+                if val and val not in seen_set:
+                    seen_set.add(val)
+                    seen.append(val)
+                    if len(seen) >= max_values:
+                        break
+        if len(seen) >= max_values:
+            break
+    result = ", ".join(seen)
+    if len(seen) >= max_values:
+        result += ", ..."
+    return result
+
+
 def transform_template(
     filename: str,
     property_names: list[str],
@@ -336,6 +549,7 @@ def transform_template(
     country: str = "",
     skip_operation: bool = False,
     data_rows: list[list[str]] | None = None,
+    resolved_picklists: dict[str, str] | None = None,
 ) -> tuple[pd.DataFrame, str | None]:
     """
     Build the enriched Import Template DataFrame.
@@ -346,9 +560,10 @@ def transform_template(
       Row 3 — Type            : friendly type name
       Row 4 — Mandatory       : true / false
       Row 5 — Max Length      : capped at 10 for date/time fields
-      Row 6 — Picklist Values : comma-separated values from template data rows
-                                (only populated for picklist/keyword-matched string columns;
-                                 empty when no data rows are present in the template)
+      Row 6 — Picklist Values : comma-separated values.  Source priority:
+                                1. resolved_picklists[norm_col] if supplied.
+                                2. _extract_picklist_values from data_rows.
+                                (empty when neither source has values)
 
     Returns (DataFrame, matched_entity_type_name).
     """
@@ -410,10 +625,15 @@ def transform_template(
             mandatories.append("")
             max_lengths.append("")
 
-        # Picklist Values row — populated from template data rows.
-        # Extracted only for SFOData.* (picklist) and keyword-matched string columns.
-        if _is_picklist_column(norm_key, typ) and data_rows:
-            picklist_values.append(_extract_picklist_values(i, data_rows))
+        # Picklist Values row.
+        # Priority: resolved_picklists (from reference file) > data_rows extraction.
+        if _is_picklist_column(norm_key, typ):
+            if resolved_picklists and norm_key in resolved_picklists:
+                picklist_values.append(resolved_picklists[norm_key])
+            elif data_rows:
+                picklist_values.append(_extract_picklist_values(i, data_rows))
+            else:
+                picklist_values.append("")
         else:
             picklist_values.append("")
 
@@ -467,6 +687,18 @@ def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
 # ---------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="PAY APP SETUP", page_icon="📋", layout="wide")
+
+    # Apply any pending configuration loaded from an uploaded JSON file.
+    # Settings are staged into "_pending_config" on upload (sidebar section 4),
+    # then applied here at the top of the next rerun so all widgets pick them up.
+    _pending = st.session_state.pop("_pending_config", None)
+    if _pending:
+        if "country" in _pending:
+            st.session_state["country_select"] = _pending["country"]
+        if "skip_operation" in _pending:
+            st.session_state["skip_operation"] = _pending["skip_operation"]
+        st.session_state["loaded_config"] = _pending
+
     st.title("PAY APP SETUP — Template Metadata Enrichment")
     st.markdown(
         "Upload your **Template files** (CSV / Excel) and the **XML metadata dictionary** "
@@ -499,6 +731,76 @@ def main():
     else:
         st.info("Upload the XML metadata file in the sidebar to get started.")
         return
+
+    # ---- Sidebar: Picklist Reference Files (optional, multiple) ----
+    st.sidebar.header("3. Picklist Reference Files")
+    picklist_ref_files = st.sidebar.file_uploader(
+        "Upload picklist reference workbook(s) or CSV(s) (optional)",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        help=(
+            "Excel workbooks with (Data) sheets (e.g. VP_PeelHunt_SF_EC_EmpDataWBProd.xlsx) "
+            "or simple 2-column CSV files (Code, Label) — one picklist per CSV. "
+            "Values from multiple files are merged (union by code)."
+        ),
+        key="picklist_ref_uploader",
+    )
+
+    picklist_tables: dict[str, list[tuple[str, str]]] = {}
+    col_to_picklist: dict[str, str] = {}
+
+    if picklist_ref_files:
+        with st.sidebar:
+            with st.spinner(f"Parsing {len(picklist_ref_files)} reference file(s)..."):
+                for ref_file in picklist_ref_files:
+                    tables, mapping = parse_picklist_reference(ref_file)
+                    # Merge tables: union values for same-named tables (dedup by code)
+                    for pl_name, values in tables.items():
+                        if pl_name not in picklist_tables:
+                            picklist_tables[pl_name] = list(values)
+                        else:
+                            existing_codes = {c for c, _ in picklist_tables[pl_name]}
+                            for code, label in values:
+                                if code not in existing_codes:
+                                    picklist_tables[pl_name].append((code, label))
+                                    existing_codes.add(code)
+                    # Merge column auto-mappings (first file that maps a column wins)
+                    for norm_col, pl_name in mapping.items():
+                        col_to_picklist.setdefault(norm_col, pl_name)
+            if picklist_tables:
+                st.success(
+                    f"Loaded **{len(picklist_tables):,}** picklist table(s) "
+                    f"from **{len(picklist_ref_files):,}** file(s), "
+                    f"with **{len(col_to_picklist):,}** auto-mapped column(s)."
+                )
+            else:
+                st.warning("No picklist tables found in the uploaded file(s).")
+
+    # ---- Sidebar: Configuration ----
+    st.sidebar.header("4. Configuration")
+    config_upload = st.sidebar.file_uploader(
+        "Load saved configuration (.json)",
+        type=["json"],
+        help="Upload a configuration file previously saved from this app to restore picklist assignments and settings.",
+        key="config_uploader",
+    )
+    if config_upload is not None:
+        try:
+            cfg = json.load(config_upload)
+            st.session_state["_pending_config"] = cfg
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Could not read configuration file: {e}")
+
+    # Show info about currently loaded config
+    loaded_cfg = st.session_state.get("loaded_config")
+    if loaded_cfg:
+        saved_at = loaded_cfg.get("saved_at", "unknown")
+        n_assignments = len(loaded_cfg.get("picklist_assignments", {}))
+        st.sidebar.info(
+            f"Config loaded (saved {saved_at}). "
+            f"{n_assignments} picklist assignment(s) restored."
+        )
 
     # ---- Main area: Template upload ----
     st.header("3. Upload Template Files")
@@ -601,8 +903,173 @@ def main():
         "**BasicUserInfoImportTemplate**."
     )
 
-    # ---- Step 5: Transform ----
-    st.header("5. Run Transformation")
+    # ---- Step 5: Picklist Assignments ----
+    st.header("5. Picklist Assignments")
+
+    resolved_picklists: dict[str, str] = {}
+
+    if picklist_tables:
+        candidates = _get_picklist_candidates(templates, global_lookup, entity_lookup)
+
+        if candidates:
+            picklist_options = [""] + sorted(picklist_tables.keys())
+
+            # Pre-compute best entity props per template for mandatory lookup
+            _tmpl_entity_props: dict[str, dict] = {}
+            for _t in templates:
+                _best_et = find_best_entity_type(_t["property_names"], entity_lookup)
+                _tmpl_entity_props[_t["name"]] = entity_lookup.get(_best_et) if _best_et else {}
+
+            editor_rows = []
+            for tmpl_name, col_name, norm_col in candidates:
+                # Auto-assigned picklist from reference files
+                auto_assigned = col_to_picklist.get(norm_col, "")
+                if auto_assigned and auto_assigned in picklist_tables:
+                    ref_pairs = picklist_tables[auto_assigned][:5]
+                    ref_preview = ", ".join(label for _, label in ref_pairs if label)
+                    if len(picklist_tables[auto_assigned]) > 5:
+                        ref_preview += ", ..."
+                    # Full label list for Final Values pre-population
+                    final_vals_default = ", ".join(
+                        label for _, label in picklist_tables[auto_assigned] if label
+                    )
+                else:
+                    auto_assigned = ""
+                    ref_preview = ""
+                    final_vals_default = ""
+
+                tmpl_data_preview = _gather_template_data_values(norm_col, templates)
+
+                # Fall back to template data if no reference table assigned
+                if not final_vals_default:
+                    final_vals_default = tmpl_data_preview
+
+                # Override with saved assignment from loaded configuration
+                _saved = st.session_state.get("loaded_config", {}).get("picklist_assignments", {})
+                if norm_col in _saved:
+                    final_vals_default = _saved[norm_col]
+
+                # Mandatory flag from XML metadata
+                ep = _tmpl_entity_props.get(tmpl_name, {})
+                meta = lookup_property(col_name, ep, global_lookup)
+                is_mandatory = (meta.get("required", "") == "true") if meta else False
+
+                editor_rows.append({
+                    "Mand.": is_mandatory,
+                    "Template": tmpl_name,
+                    "Column": col_name,
+                    "Assigned Picklist": auto_assigned,
+                    "Reference Values": ref_preview,
+                    "Template Data": tmpl_data_preview,
+                    "Final Values": final_vals_default,
+                    "_norm": norm_col,
+                })
+
+            assignments_df = pd.DataFrame(editor_rows)
+
+            st.markdown(
+                "Review or adjust picklist assignments. "
+                "**Mand.** — column is mandatory. "
+                "**Reference Values** — first 5 labels from the assigned table. "
+                "**Template Data** — values found in your uploaded data rows. "
+                "**Final Values** is what gets written to the output — edit it freely to add, "
+                "remove, or correct values. Changing **Assigned Picklist** loads a different "
+                "reference table; update **Final Values** manually if needed."
+            )
+
+            edited_df = st.data_editor(
+                assignments_df,
+                column_config={
+                    "Mand.": st.column_config.CheckboxColumn(disabled=True),
+                    "Template": st.column_config.TextColumn(disabled=True),
+                    "Column": st.column_config.TextColumn(disabled=True),
+                    "Assigned Picklist": st.column_config.SelectboxColumn(
+                        options=picklist_options,
+                        required=False,
+                    ),
+                    "Reference Values": st.column_config.TextColumn(disabled=True),
+                    "Template Data": st.column_config.TextColumn(disabled=True),
+                    "Final Values": st.column_config.TextColumn(
+                        help="Comma-separated list of valid values. Edit freely before generating.",
+                    ),
+                    "_norm": None,
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="picklist_assignments_editor",
+            )
+
+            # --- Validation warnings ---
+            mandatory_empty: list[str] = []
+            single_value: list[tuple[str, str]] = []
+            for _, row in edited_df.iterrows():
+                final_vals = str(row.get("Final Values", "") or "").strip()
+                col_display = str(row.get("Column", ""))
+                if bool(row.get("Mand.", False)) and not final_vals:
+                    mandatory_empty.append(col_display)
+                if final_vals:
+                    items = [v.strip() for v in final_vals.split(",") if v.strip()]
+                    if len(items) == 1:
+                        single_value.append((col_display, items[0]))
+
+            if mandatory_empty:
+                st.error(
+                    f"**{len(mandatory_empty)} mandatory picklist column(s) have no values:** "
+                    + ", ".join(f"`{c}`" for c in mandatory_empty)
+                )
+            if single_value:
+                st.warning(
+                    "**The following picklist column(s) have only one value** — "
+                    "check whether more options are expected: "
+                    + ", ".join(f"`{c}` ({v})" for c, v in single_value)
+                )
+
+            # Build resolved_picklists directly from Final Values column
+            for _, row in edited_df.iterrows():
+                final_vals = str(row.get("Final Values", "") or "").strip()
+                norm_col = str(row.get("_norm", "")).strip()
+                if final_vals and norm_col:
+                    resolved_picklists[norm_col] = final_vals
+        else:
+            st.info("No picklist-candidate columns were detected in the selected templates.")
+    else:
+        st.info(
+            "No Picklist Reference File uploaded. "
+            "Picklist Values will be extracted from template data rows where available."
+        )
+
+    # ---- Save Configuration ----
+    with st.expander("Save configuration", expanded=False):
+        st.markdown(
+            "Download the current settings and picklist assignments as a JSON file. "
+            "Upload it via **4. Configuration** in the sidebar to restore this session later."
+        )
+        _cfg_files = {
+            "xml_metadata": xml_file.name,
+            "picklist_references": [f.name for f in picklist_ref_files] if picklist_ref_files else [],
+            "templates": [t["name"] for t in templates],
+        }
+        _cfg_to_save = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "country": country,
+            "skip_operation": skip_operation,
+            "files_used": _cfg_files,
+            "picklist_assignments": resolved_picklists,
+        }
+        _cfg_json = json.dumps(_cfg_to_save, indent=2, ensure_ascii=False)
+        st.download_button(
+            "Download configuration (.json)",
+            data=_cfg_json.encode("utf-8"),
+            file_name=f"pay_app_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+        )
+        st.caption(
+            f"Captures: country ({country}), skip_operation ({skip_operation}), "
+            f"{len(resolved_picklists)} picklist assignment(s), and file names used."
+        )
+
+    # ---- Step 6: Transform ----
+    st.header("6. Run Transformation")
 
     if st.button("Generate Import Templates", type="primary"):
         results: list[dict] = []
@@ -618,6 +1085,7 @@ def main():
                 country,
                 skip_operation=skip_operation,
                 data_rows=t.get("data_rows", []),
+                resolved_picklists=resolved_picklists if resolved_picklists else None,
             )
             results.append({"name": t["name"], "df": result_df, "entity_type": matched_et})
             progress.progress((i + 1) / len(templates), text=f"Processed {t['name']}")
@@ -629,7 +1097,7 @@ def main():
     if "results" in st.session_state and st.session_state["results"]:
         results = st.session_state["results"]
 
-        st.header("6. Results")
+        st.header("7. Results")
 
         # Show unmatched properties summary.
         # A column is unmatched when its Column Label (sap:label) == its property name
@@ -660,7 +1128,7 @@ def main():
             st.dataframe(r["df"], use_container_width=True)
 
         # ---- Download options ----
-        st.header("7. Download")
+        st.header("8. Download")
         fmt = st.radio("Output format:", ["CSV", "XLSX"], horizontal=True)
 
         if len(results) == 1:

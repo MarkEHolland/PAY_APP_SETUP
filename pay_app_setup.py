@@ -137,8 +137,63 @@ def parse_picklist_reference(
         if len(df) < 1:
             return picklist_tables, col_to_picklist
 
+        header = [str(v).strip() for v in df.iloc[0]]
+
+        # --- SAP SuccessFactors picklist export format ---
+        # Detected by presence of 'values.externalCode' in the first header row.
+        # Row 0 = technical headers, Row 1 = human descriptions (skip both).
+        # Rows 2+ = data: one row per picklist value, grouped by 'id' column.
+        if "values.externalCode" in header:
+            col_idx = {name: i for i, name in enumerate(header)}
+            id_col = col_idx.get("id")
+            code_col = col_idx.get("values.externalCode")
+            status_col = col_idx.get("values.status")
+            # Store defaultValue label (the canonical display label in SAP)
+            label_col = col_idx.get("values.label.defaultValue")
+            label_fallback_col = col_idx.get("values.label.en_US")
+
+            if id_col is None or code_col is None:
+                st.error(f"Cannot parse SAP picklist file '{fname}': missing 'id' or 'values.externalCode' column.")
+                return picklist_tables, col_to_picklist
+
+            # Build tables as {pl_name: {code: label}} for fast dedup, then convert
+            raw: dict[str, dict[str, str]] = {}
+            for r_idx in range(2, len(df)):  # skip both header rows
+                row = df.iloc[r_idx]
+                pl_name = str(row.iloc[id_col]).strip()
+                code_val = str(row.iloc[code_col]).strip()
+                if not pl_name or pl_name.lower() == "nan":
+                    continue
+                if not code_val or code_val.lower() == "nan":
+                    continue
+                if status_col is not None and str(row.iloc[status_col]).strip() != "A":
+                    continue
+                if pl_name not in raw:
+                    raw[pl_name] = {}
+                if code_val not in raw[pl_name]:
+                    label_val = ""
+                    if label_col is not None:
+                        label_val = str(row.iloc[label_col]).strip()
+                        if label_val.lower() == "nan":
+                            label_val = ""
+                    if not label_val and label_fallback_col is not None and label_fallback_col != label_col:
+                        label_val = str(row.iloc[label_fallback_col]).strip()
+                        if label_val.lower() == "nan":
+                            label_val = ""
+                    raw[pl_name][code_val] = label_val
+
+            for pl_name, code_map in raw.items():
+                picklist_tables.setdefault(pl_name, [(c, l) for c, l in code_map.items()])
+                # Auto-map: normalised picklist name → picklist display name
+                # e.g. "GENDER" → norm "gender", "COUNTRY" → norm "country"
+                norm_pl = _normalise_property_name(pl_name)
+                col_to_picklist.setdefault(norm_pl, pl_name)
+
+            return picklist_tables, col_to_picklist
+
+        # --- Simple 2-column CSV (Code, Label) — one picklist per file ---
         # Skip a header row if the first cell looks like a column label
-        first_cell = str(df.iloc[0, 0]).strip().lower()
+        first_cell = header[0].lower()
         start_row = 1 if first_cell in ("code", "id", "value", "key", "externalcode") else 0
 
         values: list[tuple[str, str]] = []
@@ -468,6 +523,46 @@ def _extract_picklist_values(
     return ", ".join(seen)
 
 
+def _find_best_picklist(
+    norm_col: str,
+    picklist_names: list[str],
+    country: str = "",
+) -> str:
+    """
+    Find the best matching picklist table name for a normalised column name.
+
+    Scoring (higher = better):
+      100  exact normalised match
+       50  column name is a substring of the normalised picklist name
+       25  normalised picklist name is a substring of the column name
+      +10  picklist name ends with the selected country code (e.g. GBR)
+       -N  length of picklist name (prefer shorter / less-decorated names)
+
+    Returns the best-matching picklist display name, or "" if nothing scores.
+    """
+    best_name = ""
+    best_score: float = 0.0
+    country_upper = country.upper() if country else ""
+
+    for pl_name in picklist_names:
+        norm_pl = _normalise_property_name(pl_name)
+        if norm_col == norm_pl:
+            base = 100.0
+        elif norm_col in norm_pl:
+            base = 50.0
+        elif norm_pl in norm_col:
+            base = 25.0
+        else:
+            continue
+        country_bonus = 10.0 if country_upper and pl_name.upper().endswith(country_upper) else 0.0
+        score = base + country_bonus - len(pl_name) * 0.1
+        if score > best_score:
+            best_score = score
+            best_name = pl_name
+
+    return best_name
+
+
 def _get_picklist_candidates(
     templates: list[dict],
     global_lookup: dict,
@@ -729,10 +824,10 @@ def main():
         st.info("Upload the XML metadata file in the sidebar to get started.")
         return
 
-    # ---- Sidebar: Picklist Reference Files (optional, multiple) ----
-    st.sidebar.header("3. Picklist Reference Files (optional)")
+    # ---- Sidebar: Picklist Reference Files ----
+    st.sidebar.header("3. Picklist Reference Files")
     picklist_ref_files = st.sidebar.file_uploader(
-        "Upload picklist reference workbook(s) or CSV(s) (optional)",
+        "Upload picklist reference workbook(s) or CSV(s)",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
         help=(
@@ -918,26 +1013,27 @@ def main():
                 _tmpl_entity_props[_t["name"]] = entity_lookup.get(_best_et) if _best_et else {}
 
             editor_rows = []
+            pl_name_list = list(picklist_tables.keys())
+
             for tmpl_name, col_name, norm_col in candidates:
-                # Auto-assigned picklist from reference files
-                auto_assigned = col_to_picklist.get(norm_col, "")
-                if auto_assigned and auto_assigned in picklist_tables:
-                    ref_pairs = picklist_tables[auto_assigned][:5]
-                    ref_preview = ", ".join(label for _, label in ref_pairs if label)
-                    if len(picklist_tables[auto_assigned]) > 5:
-                        ref_preview += ", ..."
-                    # Full label list for Final Values pre-population
+                # Base assignment: exact mapping > fuzzy match
+                auto_assigned = (
+                    col_to_picklist.get(norm_col, "")
+                    or _find_best_picklist(norm_col, pl_name_list, country)
+                )
+                if auto_assigned and auto_assigned not in picklist_tables:
+                    auto_assigned = ""
+
+                # Final Values pre-populated from auto-assigned codes
+                if auto_assigned:
                     final_vals_default = ", ".join(
-                        label for _, label in picklist_tables[auto_assigned] if label
+                        code for code, _ in picklist_tables[auto_assigned] if code
                     )
                 else:
-                    auto_assigned = ""
-                    ref_preview = ""
                     final_vals_default = ""
 
                 tmpl_data_preview = _gather_template_data_values(norm_col, templates)
 
-                # Fall back to template data if no reference table assigned
                 if not final_vals_default:
                     final_vals_default = tmpl_data_preview
 
@@ -956,7 +1052,6 @@ def main():
                     "Template": tmpl_name,
                     "Column": col_name,
                     "Assigned Picklist": auto_assigned,
-                    "Reference Values": ref_preview,
                     "Template Data": tmpl_data_preview,
                     "Final Values": final_vals_default,
                     "_norm": norm_col,
@@ -967,11 +1062,9 @@ def main():
             st.markdown(
                 "Review or adjust picklist assignments. "
                 "**Mand.** — column is mandatory. "
-                "**Reference Values** — first 5 labels from the assigned table. "
                 "**Template Data** — values found in your uploaded data rows. "
-                "**Final Values** is what gets written to the output — edit it freely to add, "
-                "remove, or correct values. Changing **Assigned Picklist** loads a different "
-                "reference table; update **Final Values** manually if needed."
+                "**Final Values** is what gets written to the output — edit freely. "
+                "**Reference Codes / Labels** below updates when you change **Assigned Picklist**."
             )
 
             edited_df = st.data_editor(
@@ -984,7 +1077,6 @@ def main():
                         options=picklist_options,
                         required=False,
                     ),
-                    "Reference Values": st.column_config.TextColumn(disabled=True),
                     "Template Data": st.column_config.TextColumn(disabled=True),
                     "Final Values": st.column_config.TextColumn(
                         help="Comma-separated list of valid values. Edit freely before generating.",
@@ -995,6 +1087,33 @@ def main():
                 use_container_width=True,
                 key="picklist_assignments_editor",
             )
+
+            # Reference table — computed from current Assigned Picklist selections
+            # so it updates immediately whenever an assignment changes.
+            ref_rows = []
+            for _, row in edited_df.iterrows():
+                assigned = str(row.get("Assigned Picklist", "") or "")
+                if assigned and assigned in picklist_tables:
+                    pairs = picklist_tables[assigned]
+                    codes = ", ".join(c for c, _ in pairs[:10] if c)
+                    labels = ", ".join(l for _, l in pairs[:10] if l)
+                    if len(pairs) > 10:
+                        codes += ", ..."
+                        labels += ", ..."
+                else:
+                    codes = labels = ""
+                ref_rows.append({
+                    "Column": str(row.get("Column", "")),
+                    "Assigned Picklist": assigned,
+                    "Codes": codes,
+                    "Labels": labels,
+                })
+            with st.expander("Reference Codes / Labels", expanded=True):
+                st.dataframe(
+                    pd.DataFrame(ref_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
             # --- Validation warnings ---
             mandatory_empty: list[str] = []
